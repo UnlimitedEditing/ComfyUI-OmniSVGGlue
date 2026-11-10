@@ -293,6 +293,7 @@ class OmniSVGGenerate:
             "temperature": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.5, "step": 0.05}),
             "width": ("INT", {"default": 0, "min": 0, "max": 4096}),
             "height": ("INT", {"default": 0, "min": 0, "max": 4096}),
+            "init_image_filename": ("STRING", {"default": ""}),
             "seed": ("INT", {"default": 0, "min": 0, "max": 2 ** 31 - 1}),
         }}
 
@@ -301,7 +302,7 @@ class OmniSVGGenerate:
     FUNCTION = "run"
     CATEGORY = "OmniSVG"
 
-    def run(self, model, prompt, init_image_url, max_length, temperature, seed, width, height):
+    def run(self, model, prompt, init_image_url, max_length, temperature, width, height, init_image_filename, seed):
         inf, _ = _inference()
         random.seed(seed)
         np.random.seed(seed)
@@ -317,9 +318,18 @@ class OmniSVGGenerate:
             max_length=max_length, replace_background=False, num_candidates=1, use_accelerate=True)
         dev, dt = model["dev"], model["torch_dtype"]
         url = (init_image_url or "").strip()
-        if url:
-            print(f"{TAG} image-to-SVG from {url[:80]}", flush=True)
-            img = _download_image(url)
+        fname = (init_image_filename or "").strip()
+        local = None
+        if not url and fname:
+            for cand in (fname, os.path.join(folder_paths.get_input_directory(), fname)):
+                if os.path.isfile(cand):
+                    local = cand
+                    break
+            if local is None:
+                print(f"{TAG} init_image_filename '{fname}' not found in input dir; falling back to text mode", flush=True)
+        if url or local:
+            print(f"{TAG} image-to-SVG from {url[:80] or local}", flush=True)
+            img = _download_image(url) if url else Image.open(local)
             files, _pngs = inf.process_image_to_svg(model["sketch_decoder"], model["svg_tokenizer"], model["processor"],
                                                     [img], dev, dt, args, model["config"])
         else:
