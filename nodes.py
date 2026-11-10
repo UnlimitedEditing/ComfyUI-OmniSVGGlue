@@ -101,6 +101,9 @@ def _ensure_deps():
     if not _have("cv2"):
         _pip("--no-deps", "opencv-python-headless")
 
+    if not _have("moviepy"):  # deepsvg imports it unconditionally but generation never uses it
+        _stub_module("moviepy", {"ImageClip": None, "concatenate_videoclips": None})
+
     if not _have("IPython"):
         if not _pip("ipython"):
             _stub_module("IPython")
