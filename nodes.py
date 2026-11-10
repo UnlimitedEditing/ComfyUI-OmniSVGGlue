@@ -301,34 +301,43 @@ class OmniSVGGenerate:
             "model": ("OMNISVG_MODEL",),
             "prompt": ("STRING", {"multiline": True, "default": "A yellow t-shirt with a heart design."}),
             "init_image_url": ("STRING", {"default": ""}),
-            "max_length": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 64}),
+            "max_length": ("INT", {"default": 1536, "min": 256, "max": 4096, "step": 64}),
             "temperature": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.5, "step": 0.05}),
             "width": ("INT", {"default": 0, "min": 0, "max": 4096}),
             "height": ("INT", {"default": 0, "min": 0, "max": 4096}),
             "init_image_filename": ("STRING", {"default": ""}),
+            "num_candidates": ("INT", {"default": 6, "min": 1, "max": 8}),
+            "repetition_penalty": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.01}),
             "seed": ("INT", {"default": 0, "min": 0, "max": 2 ** 31 - 1}),
         }}
 
-    RETURN_TYPES = ("IMAGE", "STRING", "IMAGE")
-    RETURN_NAMES = ("preview", "svg_text", "svg_data")
+    RETURN_TYPES = ("IMAGE", "STRING", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("preview", "svg_text", "svg_data", "candidates_sheet")
     FUNCTION = "run"
     CATEGORY = "OmniSVG"
 
-    def run(self, model, prompt, init_image_url, max_length, temperature, width, height, init_image_filename, seed):
+    @staticmethod
+    def _score(ref_small, cand_img):
+        a = np.asarray(ref_small, dtype=np.float32)
+        b = np.asarray(cand_img.convert("RGB").resize(ref_small.size, Image.BILINEAR), dtype=np.float32)
+        return float(np.abs(a - b).mean())
+
+    def run(self, model, prompt, init_image_url, max_length, temperature, width, height, init_image_filename,
+            num_candidates, repetition_penalty, seed):
+        from PIL import ImageDraw
+        import tempfile
+        from urllib.parse import urlparse
         inf, _ = _inference()
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-
-        out_dir = os.path.join(folder_paths.get_output_directory(), "omnisvg")
-        os.makedirs(out_dir, exist_ok=True)
-        args = types.SimpleNamespace(
-            verbose=True, output=out_dir, save_all_candidates=False, save_png=True,
-            top_p=None, top_k=None, repetition_penalty=None,
-            temperature=(temperature if temperature > 0 else None),
-            max_length=max_length, replace_background=False, num_candidates=1, use_accelerate=True)
-        dev, dt = model["dev"], model["torch_dtype"]
+        cfgs = model["config"].get("task_configs", {})
+        defaults = {
+            "icon": cfgs.get("text_to_svg_icon", {"default_temperature": 0.5, "default_top_p": 0.88, "default_top_k": 50, "default_repetition_penalty": 1.05}),
+            "illustration": cfgs.get("text_to_svg_illustration", {"default_temperature": 0.6, "default_top_p": 0.90, "default_top_k": 60, "default_repetition_penalty": 1.03}),
+            "image": cfgs.get("image_to_svg", {"default_temperature": 0.3, "default_top_p": 0.90, "default_top_k": 50, "default_repetition_penalty": 1.05}),
+        }
         url = (init_image_url or "").strip()
         fname = (init_image_filename or "").strip()
         local = None
@@ -339,34 +348,71 @@ class OmniSVGGenerate:
                     break
             if local is None:
                 print(f"{TAG} init_image_filename '{fname}' not found in input dir; falling back to text mode", flush=True)
+        ref_small = None
         if url or local:
-            from urllib.parse import urlparse
             print(f"{TAG} image-to-SVG from {(urlparse(url).netloc + ' (url hidden)') if url else local}", flush=True)
-            img = _download_image(url) if url else Image.open(local)
-            files, _pngs = inf.process_image_to_svg(model["sketch_decoder"], model["svg_tokenizer"], model["processor"],
-                                                    [img], dev, dt, args, model["config"])
+            src = _download_image(url) if url else Image.open(local)
+            img_p, _mod = inf.preprocess_image_for_svg(src, replace_background=False, target_size=448)
+            ref_small = img_p.resize((128, 128), Image.BILINEAR)
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+                img_p.save(tf.name, format="PNG")
+                tmp = tf.name
+            inputs = inf.prepare_inputs("image-to-svg", model["processor"], tmp)
+            task, subtype = "image-to-svg", "image"
         else:
             print(f"{TAG} text-to-SVG: {prompt[:80]}", flush=True)
-            files, _pngs = inf.process_text_to_svg(model["sketch_decoder"], model["svg_tokenizer"], model["processor"],
-                                                   prompt, dev, dt, args, "auto", model["config"])
-        paths = []
-        for f in files:
-            if isinstance(f, str):
-                paths.append(f)
-            elif isinstance(f, list):
-                paths += [x for x in f if isinstance(x, str)]
-        if not paths:
+            subtype = inf.detect_text_subtype(prompt)
+            inputs = inf.prepare_inputs("text-to-svg", model["processor"], prompt)
+            task = "text-to-svg"
+        d = defaults[subtype]
+        temp = temperature if temperature > 0 else d["default_temperature"]
+        rep = repetition_penalty if repetition_penalty > 0 else d["default_repetition_penalty"]
+        print(f"{TAG} {task}/{subtype}: temp={temp} top_p={d['default_top_p']} top_k={d['default_top_k']} rep={rep} "
+              f"max_length={max_length} candidates={num_candidates}", flush=True)
+        cands = inf.generate_candidates(model["sketch_decoder"], model["svg_tokenizer"], inputs, task, subtype,
+                                        temp, d["default_top_p"], d["default_top_k"], rep, max_length,
+                                        num_candidates, model["config"], torch_dtype=model["torch_dtype"])
+        if not cands:
             raise RuntimeError("OmniSVG produced no valid SVG for this input. Try another seed, a simpler prompt, "
                                "or a larger max_length.")
-        with open(paths[0], "r", encoding="utf-8") as fh:
-            svg = fh.read()
-        w = width or 1024
-        h = height or 1024
-        preview = _render(svg, w, h)
+        for c in cands:
+            c["score"] = self._score(ref_small, c["img"]) if ref_small is not None else None
+        order = list(range(len(cands)))
+        if ref_small is not None:
+            order.sort(key=lambda i: cands[i]["score"])
+        best = cands[order[0]]
+        print(f"{TAG} {len(cands)} valid candidates; scores="
+              f"{[round(c['score'], 1) if c['score'] is not None else None for c in cands]}; best=#{order[0] + 1}", flush=True)
+
+        # contact sheet: reference (image mode) + every candidate, labelled
+        tile = 256
+        tiles = []
+        if ref_small is not None:
+            tiles.append(("REF", ref_small.resize((tile, tile))))
+        for rank, i in enumerate(order):
+            c = cands[i]
+            lab = f"#{i + 1} paths={c['path_count']}" + (f" err={c['score']:.1f}" if c["score"] is not None else "")
+            tiles.append((("BEST " if rank == 0 else "") + lab, c["img"].resize((tile, tile), Image.BILINEAR)))
+        cols = min(4, len(tiles))
+        rows = (len(tiles) + cols - 1) // cols
+        sheet = Image.new("RGB", (cols * tile, rows * (tile + 16)), (255, 255, 255))
+        dr = ImageDraw.Draw(sheet)
+        for k, (lab, im) in enumerate(tiles):
+            x, y = (k % cols) * tile, (k // cols) * (tile + 16)
+            sheet.paste(im, (x, y + 16))
+            dr.text((x + 3, y + 2), lab, fill=(0, 0, 0))
+
+        out_dir = os.path.join(folder_paths.get_output_directory(), "omnisvg")
+        os.makedirs(out_dir, exist_ok=True)
+        svg = best["svg"]
+        path = os.path.join(out_dir, f"omnisvg_{seed}.svg")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(svg)
+        preview = _render(svg, width or 1024, height or 1024)
         gc.collect()
         torch.cuda.empty_cache()
-        print(f"{TAG} svg {len(svg)} chars, saved {paths[0]}", flush=True)
-        return (_pil2tensor(preview), svg, _encode_string_as_image(svg))
+        print(f"{TAG} svg {len(svg)} chars, saved {path}", flush=True)
+        return (_pil2tensor(preview), svg, _encode_string_as_image(svg), _pil2tensor(sheet))
 
 
 NODE_CLASS_MAPPINGS = {"OmniSVGLoadFast": OmniSVGLoadFast, "OmniSVGGenerate": OmniSVGGenerate}
