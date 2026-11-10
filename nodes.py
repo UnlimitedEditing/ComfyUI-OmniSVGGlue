@@ -331,7 +331,8 @@ class OmniSVGGenerate:
             if local is None:
                 print(f"{TAG} init_image_filename '{fname}' not found in input dir; falling back to text mode", flush=True)
         if url or local:
-            print(f"{TAG} image-to-SVG from {url[:80] or local}", flush=True)
+            from urllib.parse import urlparse
+            print(f"{TAG} image-to-SVG from {(urlparse(url).netloc + ' (url hidden)') if url else local}", flush=True)
             img = _download_image(url) if url else Image.open(local)
             files, _pngs = inf.process_image_to_svg(model["sketch_decoder"], model["svg_tokenizer"], model["processor"],
                                                     [img], dev, dt, args, model["config"])
