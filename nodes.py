@@ -228,6 +228,16 @@ class OmniSVGLoadFast:
         if getattr(cfg, "text_config", None) is not None:
             cfg.text_config.vocab_size = vocab
 
+        try:
+            import transformers as _tf
+            try:
+                import qwen_vl_utils as _qv
+                qv = getattr(_qv, "__version__", "?")
+            except Exception:
+                qv = "none"
+            print(f"{TAG} versions: transformers {_tf.__version__}, torch {torch.__version__}, qwen_vl_utils {qv}", flush=True)
+        except Exception:
+            pass
         print(f"{TAG} building {model_size} architecture on {dev} ({bf16}), vocab {vocab}", flush=True)
         try:
             from transformers.modeling_utils import no_init_weights
@@ -364,6 +374,14 @@ class OmniSVGGenerate:
             subtype = inf.detect_text_subtype(prompt)
             inputs = inf.prepare_inputs("text-to-svg", model["processor"], prompt)
             task = "text-to-svg"
+        try:
+            ig = inputs.get("image_grid_thw")
+            pv = inputs.get("pixel_values")
+            print(f"{TAG} inputs: ids {tuple(inputs['input_ids'].shape)}, pixel_values "
+                  f"{tuple(pv.shape) if pv is not None else None}, image_grid_thw "
+                  f"{ig.tolist() if ig is not None else None}", flush=True)
+        except Exception as e:
+            print(f"{TAG} inputs debug failed: {e}", flush=True)
         d = defaults[subtype]
         temp = temperature if temperature > 0 else d["default_temperature"]
         rep = repetition_penalty if repetition_penalty > 0 else d["default_repetition_penalty"]
