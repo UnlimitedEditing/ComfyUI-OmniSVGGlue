@@ -95,7 +95,7 @@ def _ensure_deps():
             _install_cairosvg_shim()
 
     missing = [pip for mod, pip in (("accelerate", "accelerate"), ("networkx", "networkx"), ("cv2", None),
-                                    ("yaml", "pyyaml"), ("einops", "einops")) if pip and not _have(mod)]
+                                    ("yaml", "pyyaml"), ("einops", "einops"), ("shapely", "shapely")) if pip and not _have(mod)]
     if missing:
         _pip(*missing)
     if not _have("cv2"):
