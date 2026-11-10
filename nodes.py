@@ -182,6 +182,51 @@ def _download_image(url):
         return Image.open(io.BytesIO(r.read()))
 
 
+
+def _ensure_pinned_transformers(pin):
+    target = os.path.join(folder_paths.models_dir, "omnisvg", "tf_" + pin.replace(".", "_"))
+    if os.path.isfile(os.path.join(target, "transformers", "__init__.py")):
+        return target
+    os.makedirs(target, exist_ok=True)
+    tok = "0.21.1" if pin.startswith("4.51") else None
+    specs = [f"transformers=={pin}", "huggingface-hub<1.0"] + ([f"tokenizers=={tok}"] if tok else [])
+    print(f"{TAG} installing pinned {specs} into {target}", flush=True)
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "--no-input", "--disable-pip-version-check", "-q",
+                        "--no-deps", "--target", target, *specs], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"pinned transformers install failed: {r.stderr[-600:]}")
+    return target
+
+
+def _run_subprocess(cfg, gen_args):
+    import json
+    import tempfile
+    _ensure_deps()
+    target = _ensure_pinned_transformers(cfg["pin"])
+    work = tempfile.mkdtemp(prefix="omnisvg_job_")
+    job = {"load": {k: cfg[k] for k in ("weights_name", "model_size", "attn")}, "gen": gen_args, "out": work,
+           "nodes_path": os.path.abspath(__file__)}
+    jp = os.path.join(work, "job.json")
+    with open(jp, "w", encoding="utf-8") as f:
+        json.dump(job, f)
+    comfy_root = os.path.dirname(os.path.abspath(folder_paths.__file__))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([target, comfy_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    env["PYTHONUNBUFFERED"] = "1"
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker.py")
+    print(f"{TAG} running worker with transformers pin {cfg['pin']}", flush=True)
+    pr = subprocess.Popen([sys.executable, worker, jp], cwd=comfy_root, env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True, bufsize=1)
+    for line in pr.stdout:
+        print(line.rstrip(), flush=True)
+    if pr.wait() != 0:
+        raise RuntimeError(f"OmniSVG worker failed (exit {pr.returncode}); see log above")
+    with open(os.path.join(work, "svg.svg"), "r", encoding="utf-8") as f:
+        svg = f.read()
+    prev = Image.open(os.path.join(work, "preview.png")).convert("RGB")
+    sheet = Image.open(os.path.join(work, "sheet.png")).convert("RGB")
+    return (_pil2tensor(prev), svg, _encode_string_as_image(svg), _pil2tensor(sheet))
+
 # ---------------------------------------------------------------------------------------------------------------
 # nodes
 # ---------------------------------------------------------------------------------------------------------------
@@ -191,6 +236,8 @@ class OmniSVGLoadFast:
         return {"required": {
             "weights_name": ("STRING", {"default": "OmniSVG1.1_8B.bin"}),
             "model_size": (["8B", "4B"], {"default": "8B"}),
+            "attn": (["sdpa", "eager"], {"default": "sdpa"}),
+            "transformers_pin": ("STRING", {"default": ""}),
         }}
 
     RETURN_TYPES = ("OMNISVG_MODEL",)
@@ -198,7 +245,10 @@ class OmniSVGLoadFast:
     FUNCTION = "load"
     CATEGORY = "OmniSVG"
 
-    def load(self, weights_name, model_size):
+    def load(self, weights_name, model_size, attn="sdpa", transformers_pin=""):
+        if (transformers_pin or "").strip():
+            return ({"subprocess": {"weights_name": weights_name, "model_size": model_size, "attn": attn,
+                                    "pin": transformers_pin.strip()}},)
         import yaml
         from transformers import AutoConfig, AutoProcessor, AutoTokenizer
         try:
@@ -238,7 +288,7 @@ class OmniSVGLoadFast:
             print(f"{TAG} versions: transformers {_tf.__version__}, torch {torch.__version__}, qwen_vl_utils {qv}", flush=True)
         except Exception:
             pass
-        print(f"{TAG} building {model_size} architecture on {dev} ({bf16}), vocab {vocab}", flush=True)
+        print(f"{TAG} building {model_size} architecture on {dev} ({bf16}), vocab {vocab}, attn {attn}", flush=True)
         try:
             from transformers.modeling_utils import no_init_weights
             ctx = no_init_weights()
@@ -248,7 +298,7 @@ class OmniSVGLoadFast:
         torch.set_default_dtype(bf16)
         try:
             with ctx, torch.device(dev):
-                model = QwenVL._from_config(cfg, attn_implementation="sdpa")
+                model = QwenVL._from_config(cfg, attn_implementation=attn)
         finally:
             torch.set_default_dtype(prev)
         # Cast PARAMETERS only: model.to(dtype) would also cast the rotary inv_freq buffers to bf16, which wrecks
@@ -334,6 +384,11 @@ class OmniSVGGenerate:
 
     def run(self, model, prompt, init_image_url, max_length, temperature, width, height, init_image_filename,
             num_candidates, repetition_penalty, seed):
+        if model.get("subprocess"):
+            return _run_subprocess(model["subprocess"], dict(
+                prompt=prompt, init_image_url=init_image_url, max_length=max_length, temperature=temperature,
+                width=width, height=height, init_image_filename=init_image_filename,
+                num_candidates=num_candidates, repetition_penalty=repetition_penalty, seed=seed))
         from PIL import ImageDraw
         import tempfile
         from urllib.parse import urlparse
