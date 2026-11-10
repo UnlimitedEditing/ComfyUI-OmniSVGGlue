@@ -241,7 +241,16 @@ class OmniSVGLoadFast:
                 model = QwenVL._from_config(cfg, attn_implementation="sdpa")
         finally:
             torch.set_default_dtype(prev)
-        model = model.to(dtype=bf16)
+        # Cast PARAMETERS only: model.to(dtype) would also cast the rotary inv_freq buffers to bf16, which wrecks
+        # position encoding (transformers keeps them float32 on purpose).
+        for prm in model.parameters():
+            if prm.is_floating_point() and prm.dtype != bf16:
+                prm.data = prm.data.to(bf16)
+        bufs = {}
+        for n_, b_ in model.named_buffers():
+            bufs.setdefault((n_.split(".")[-1], str(b_.dtype)), 0)
+            bufs[(n_.split(".")[-1], str(b_.dtype))] += 1
+        print(f"{TAG} buffer dtypes: {bufs}", flush=True)
 
         print(f"{TAG} reading {weights}", flush=True)
         try:
