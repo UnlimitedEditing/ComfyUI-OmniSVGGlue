@@ -359,14 +359,13 @@ class OmniSVGGenerate:
     def INPUT_TYPES(cls):
         return {"required": {
             "model": ("OMNISVG_MODEL",),
-            "prompt": ("STRING", {"multiline": True, "default": "A yellow t-shirt with a heart design."}),
             "init_image_url": ("STRING", {"default": ""}),
-            "max_length": ("INT", {"default": 1536, "min": 256, "max": 4096, "step": 64}),
+            "max_length": ("INT", {"default": 2560, "min": 256, "max": 4096, "step": 64}),
             "temperature": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.5, "step": 0.05}),
             "width": ("INT", {"default": 0, "min": 0, "max": 4096}),
             "height": ("INT", {"default": 0, "min": 0, "max": 4096}),
             "init_image_filename": ("STRING", {"default": ""}),
-            "num_candidates": ("INT", {"default": 6, "min": 1, "max": 8}),
+            "num_candidates": ("INT", {"default": 4, "min": 1, "max": 8}),
             "repetition_penalty": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.01}),
             "seed": ("INT", {"default": 0, "min": 0, "max": 2 ** 31 - 1}),
         }}
@@ -382,11 +381,11 @@ class OmniSVGGenerate:
         b = np.asarray(cand_img.convert("RGB").resize(ref_small.size, Image.BILINEAR), dtype=np.float32)
         return float(np.abs(a - b).mean())
 
-    def run(self, model, prompt, init_image_url, max_length, temperature, width, height, init_image_filename,
+    def run(self, model, init_image_url, max_length, temperature, width, height, init_image_filename,
             num_candidates, repetition_penalty, seed):
         if model.get("subprocess"):
             return _run_subprocess(model["subprocess"], dict(
-                prompt=prompt, init_image_url=init_image_url, max_length=max_length, temperature=temperature,
+                init_image_url=init_image_url, max_length=max_length, temperature=temperature,
                 width=width, height=height, init_image_filename=init_image_filename,
                 num_candidates=num_candidates, repetition_penalty=repetition_penalty, seed=seed))
         from PIL import ImageDraw
@@ -411,24 +410,17 @@ class OmniSVGGenerate:
                 if os.path.isfile(cand):
                     local = cand
                     break
-            if local is None:
-                print(f"{TAG} init_image_filename '{fname}' not found in input dir; falling back to text mode", flush=True)
-        ref_small = None
-        if url or local:
-            print(f"{TAG} image-to-SVG from {(urlparse(url).netloc + ' (url hidden)') if url else local}", flush=True)
-            src = _download_image(url) if url else Image.open(local)
-            img_p, _mod = inf.preprocess_image_for_svg(src, replace_background=False, target_size=448)
-            ref_small = img_p.resize((128, 128), Image.BILINEAR)
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
-                img_p.save(tf.name, format="PNG")
-                tmp = tf.name
-            inputs = inf.prepare_inputs("image-to-svg", model["processor"], tmp)
-            task, subtype = "image-to-svg", "image"
-        else:
-            print(f"{TAG} text-to-SVG: {prompt[:80]}", flush=True)
-            subtype = inf.detect_text_subtype(prompt)
-            inputs = inf.prepare_inputs("text-to-svg", model["processor"], prompt)
-            task = "text-to-svg"
+        if not (url or local):
+            raise RuntimeError("OmniSVG is image-to-SVG only: attach an image to vectorise (/init-image or /image1).")
+        print(f"{TAG} image-to-SVG from {(urlparse(url).netloc + ' (url hidden)') if url else local}", flush=True)
+        src = _download_image(url) if url else Image.open(local)
+        img_p, _mod = inf.preprocess_image_for_svg(src, replace_background=False, target_size=448)
+        ref_small = img_p.resize((128, 128), Image.BILINEAR)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+            img_p.save(tf.name, format="PNG")
+            tmp = tf.name
+        inputs = inf.prepare_inputs("image-to-svg", model["processor"], tmp)
+        task, subtype = "image-to-svg", "image"
         try:
             ig = inputs.get("image_grid_thw")
             pv = inputs.get("pixel_values")
